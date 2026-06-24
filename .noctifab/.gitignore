@@ -1,0 +1,4 @@
+config/noctifab.db
+logs/
+worktrees/
+noctifab.pid
