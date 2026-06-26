@@ -1,42 +1,32 @@
 import redis
-from typing import Optional
+from .exceptions import ConnectionError
+from .connections import ConnectionManager
 
-_redis_client: Optional[redis.Redis] = None
+def _get_queue_key(queue_name: str) -> str:
+    """Returns the Redis key for a given queue name."""
+    return f"frontpunch:queue:{queue_name}"
 
-
-class ConfigurationError(Exception):
-    """Raised when the library is not configured correctly."""
-    pass
-
-
-def configure(redis_url: str):
+class Client:
     """
-    Configures the Frontpunch client with a Redis connection.
-
-    Args:
-        redis_url: The URL for the Redis server (e.g., "redis://localhost:6379/0").
+    Frontpunch client for enqueuing jobs.
     """
-    global _redis_client
-    # decode_responses=True is a good default for most string-based interactions
-    _redis_client = redis.from_url(redis_url, decode_responses=True)
+    def __init__(self, connection_manager: ConnectionManager):
+        self.connection_manager = connection_manager
 
+    def _enqueue(self, queue_name: str, payload: str):
+        """
+        Internal function to enqueue a job.
 
-def get_client() -> redis.Redis:
-    """
-    Retrieves the configured Redis client.
+        Args:
+            queue_name: The name of the queue.
+            payload: The serialized JSON payload of the job.
 
-    Returns:
-        The configured redis.Redis instance.
-
-    Raises:
-        ConfigurationError: If the client has not been configured yet.
-    """
-    if _redis_client is None:
-        raise ConfigurationError("Frontpunch not configured. Please call frontpunch.configure() first.")
-    return _redis_client
-
-
-def _reset_client():
-    """For testing purposes only. Resets the global client."""
-    global _redis_client
-    _redis_client = None
+        Raises:
+            ConnectionError: If a connection to Redis cannot be established.
+        """
+        try:
+            conn = self.connection_manager.get_connection()
+            queue_key = _get_queue_key(queue_name)
+            conn.lpush(queue_key, payload)
+        except redis.exceptions.ConnectionError as e:
+            raise ConnectionError("Failed to connect to Redis") from e

@@ -1,68 +1,58 @@
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 
-from frontpunch import client
+import redis
 
-class TestClientConfiguration(unittest.TestCase):
+from frontpunch.client import Client, _get_queue_key
+from frontpunch.connections import ConnectionManager
+from frontpunch.exceptions import ConnectionError
 
-    def tearDown(self):
-        # Reset the client state after each test
-        client._reset_client()
+class TestClient(unittest.TestCase):
 
-    def test_get_client_before_configuration(self):
-        """
-        Test that get_client raises ConfigurationError if called before configure.
-        """
-        with self.assertRaises(client.ConfigurationError):
-            client.get_client()
+    def setUp(self):
+        self.mock_connection_manager = MagicMock(spec=ConnectionManager)
+        self.mock_redis_conn = MagicMock(spec=redis.Redis)
+        self.mock_connection_manager.get_connection.return_value = self.mock_redis_conn
+        self.client = Client(self.mock_connection_manager)
 
-    @patch('redis.from_url')
-    def test_configure_initializes_client(self, mock_from_url):
-        """
-        Test that configure initializes the Redis client with the given URL.
-        """
-        mock_redis_instance = MagicMock()
-        mock_from_url.return_value = mock_redis_instance
-        
-        redis_url = "redis://localhost:6379/0"
-        client.configure(redis_url=redis_url)
-        
-        mock_from_url.assert_called_once_with(redis_url, decode_responses=True)
-        
-        retrieved_client = client.get_client()
-        self.assertIs(retrieved_client, mock_redis_instance)
+    def test_get_queue_key(self):
+        """Tests the queue key generation."""
+        self.assertEqual(_get_queue_key("default"), "frontpunch:queue:default")
+        self.assertEqual(_get_queue_key("high_priority"), "frontpunch:queue:high_priority")
 
-    @patch('redis.from_url')
-    def test_configure_multiple_times(self, mock_from_url):
-        """
-        Test that calling configure multiple times re-initializes the client.
-        """
-        mock_redis_instance1 = MagicMock()
-        mock_redis_instance2 = MagicMock()
-        mock_from_url.side_effect = [mock_redis_instance1, mock_redis_instance2]
+    def test_enqueue_success(self):
+        """Tests successful enqueueing of a job."""
+        queue_name = "test_queue"
+        payload = '{"job_id": "123", "data": "test"}'
+        expected_key = f"frontpunch:queue:{queue_name}"
 
-        # First call
-        redis_url1 = "redis://localhost:6379/1"
-        client.configure(redis_url=redis_url1)
-        retrieved_client1 = client.get_client()
-        self.assertIs(retrieved_client1, mock_redis_instance1)
-        mock_from_url.assert_called_with(redis_url1, decode_responses=True)
-        self.assertEqual(mock_from_url.call_count, 1)
+        self.client._enqueue(queue_name, payload)
 
-        # Second call
-        redis_url2 = "redis://localhost:6379/2"
-        client.configure(redis_url=redis_url2)
-        retrieved_client2 = client.get_client()
-        self.assertIs(retrieved_client2, mock_redis_instance2)
-        mock_from_url.assert_called_with(redis_url2, decode_responses=True)
-        self.assertEqual(mock_from_url.call_count, 2)
+        self.mock_connection_manager.get_connection.assert_called_once()
+        self.mock_redis_conn.lpush.assert_called_once_with(expected_key, payload)
 
-    def test_configuration_error_message(self):
-        """
-        Test the error message of ConfigurationError.
-        """
-        with self.assertRaisesRegex(client.ConfigurationError, "Frontpunch not configured. Please call frontpunch.configure() first."):
-            client.get_client()
+    def test_enqueue_lpush_connection_failure(self):
+        """Tests that ConnectionError is raised on Redis lpush failure."""
+        self.mock_redis_conn.lpush.side_effect = redis.exceptions.ConnectionError("Redis down")
+
+        queue_name = "test_queue"
+        payload = '{"job_id": "123", "data": "test"}'
+
+        with self.assertRaises(ConnectionError) as cm:
+            self.client._enqueue(queue_name, payload)
+
+        self.assertIn("Failed to connect to Redis", str(cm.exception))
+        self.mock_connection_manager.get_connection.assert_called_once()
+
+    def test_get_connection_failure(self):
+        """Tests that ConnectionError is raised if getting a connection fails."""
+        self.mock_connection_manager.get_connection.side_effect = redis.exceptions.ConnectionError("Redis down")
+
+        queue_name = "test_queue"
+        payload = '{"job_id": "123", "data": "test"}'
+
+        with self.assertRaises(ConnectionError):
+            self.client._enqueue(queue_name, payload)
 
 if __name__ == '__main__':
     unittest.main()

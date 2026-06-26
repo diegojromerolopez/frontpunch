@@ -3,5 +3,5 @@ class FrontpunchException(Exception):
     pass
 
 class ConnectionError(FrontpunchException):
-    """Raised when a connection to the Front API fails."""
+    """Raised when a connection to Redis cannot be established."""
     pass
