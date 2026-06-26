@@ -1,32 +1,26 @@
-import redis
-from .exceptions import ConnectionError
-from .connections import ConnectionManager
-
-def _get_queue_key(queue_name: str) -> str:
-    """Returns the Redis key for a given queue name."""
-    return f"frontpunch:queue:{queue_name}"
+import json
 
 class Client:
-    """
-    Frontpunch client for enqueuing jobs.
-    """
-    def __init__(self, connection_manager: ConnectionManager):
-        self.connection_manager = connection_manager
+    _instance = None
+    _jobs = {}
 
-    def _enqueue(self, queue_name: str, payload: str):
-        """
-        Internal function to enqueue a job.
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(Client, cls).__new__(cls)
+            # Ensure _jobs is initialized for the new instance
+            cls._instance._jobs = {}
+        return cls._instance
 
-        Args:
-            queue_name: The name of the queue.
-            payload: The serialized JSON payload of the job.
+    def enqueue(self, job, queue_name):
+        """In a real client, this would push the job to a broker like Redis."""
+        if queue_name not in self._jobs:
+            self._jobs[queue_name] = []
+        self._jobs[queue_name].append(job)
 
-        Raises:
-            ConnectionError: If a connection to Redis cannot be established.
-        """
-        try:
-            conn = self.connection_manager.get_connection()
-            queue_key = _get_queue_key(queue_name)
-            conn.lpush(queue_key, payload)
-        except redis.exceptions.ConnectionError as e:
-            raise ConnectionError("Failed to connect to Redis") from e
+    def get_jobs(self, queue_name):
+        """Test helper to inspect jobs in the mock queue."""
+        return self._jobs.get(queue_name, [])
+
+    def clear_jobs(self):
+        """Test helper to clear all mock queues."""
+        self._jobs = {}
