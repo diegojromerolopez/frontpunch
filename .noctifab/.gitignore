@@ -1,4 +1,5 @@
-config/noctifab.db
+data/
 logs/
 worktrees/
 noctifab.pid
+secrets.yaml
