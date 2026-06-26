@@ -1,55 +1,68 @@
 import unittest
 from unittest.mock import patch, MagicMock
 
-try:
-    import redis
-    from frontpunch.client import RedisConnectionManager
-except ImportError:
-    redis = None
-    RedisConnectionManager = None
+from frontpunch import client
 
+class TestClientConfiguration(unittest.TestCase):
 
-@unittest.skipIf(RedisConnectionManager is None, "redis-py is not installed or frontpunch.client is missing")
-class TestRedisConnectionManager(unittest.TestCase):
+    def tearDown(self):
+        # Reset the client state after each test
+        client._reset_client()
 
-    @patch('redis.ConnectionPool.from_url')
-    def test_initialization_with_redis_url(self, mock_from_url):
-        """Test that the manager initializes a connection pool from a redis:// URL."""
-        redis_url = "redis://localhost:6379/0"
-        manager = RedisConnectionManager(redis_url)
-        mock_from_url.assert_called_once_with(redis_url, decode_responses=True)
-        self.assertIsNotNone(manager._pool)
+    def test_get_client_before_configuration(self):
+        """
+        Test that get_client raises ConfigurationError if called before configure.
+        """
+        with self.assertRaises(client.ConfigurationError):
+            client.get_client()
 
-    @patch('redis.ConnectionPool.from_url')
-    def test_initialization_with_rediss_url(self, mock_from_url):
-        """Test that the manager initializes a connection pool from a rediss:// URL."""
-        redis_url = "rediss://user:password@my-secure-redis:6379/1"
-        manager = RedisConnectionManager(redis_url)
-        mock_from_url.assert_called_once_with(redis_url, decode_responses=True)
-        self.assertIsNotNone(manager._pool)
-
-    def test_initialization_with_empty_url(self):
-        """Test that initialization fails with an empty URL."""
-        with self.assertRaises(ValueError) as cm:
-            RedisConnectionManager("")
-        self.assertEqual(str(cm.exception), "redis_url cannot be empty.")
-
-    @patch('redis.ConnectionPool.from_url')
-    @patch('redis.Redis')
-    def test_get_connection(self, mock_redis_class, mock_from_url):
-        """Test that get_connection returns a client from the pool."""
-        mock_pool = MagicMock()
-        mock_from_url.return_value = mock_pool
+    @patch('redis.from_url')
+    def test_configure_initializes_client(self, mock_from_url):
+        """
+        Test that configure initializes the Redis client with the given URL.
+        """
         mock_redis_instance = MagicMock()
-        mock_redis_class.return_value = mock_redis_instance
-
-        redis_url = "redis://localhost:6379/0"
-        manager = RedisConnectionManager(redis_url)
+        mock_from_url.return_value = mock_redis_instance
         
-        connection = manager.get_connection()
+        redis_url = "redis://localhost:6379/0"
+        client.configure(redis_url=redis_url)
+        
+        mock_from_url.assert_called_once_with(redis_url, decode_responses=True)
+        
+        retrieved_client = client.get_client()
+        self.assertIs(retrieved_client, mock_redis_instance)
 
-        mock_redis_class.assert_called_once_with(connection_pool=mock_pool)
-        self.assertIs(connection, mock_redis_instance)
+    @patch('redis.from_url')
+    def test_configure_multiple_times(self, mock_from_url):
+        """
+        Test that calling configure multiple times re-initializes the client.
+        """
+        mock_redis_instance1 = MagicMock()
+        mock_redis_instance2 = MagicMock()
+        mock_from_url.side_effect = [mock_redis_instance1, mock_redis_instance2]
+
+        # First call
+        redis_url1 = "redis://localhost:6379/1"
+        client.configure(redis_url=redis_url1)
+        retrieved_client1 = client.get_client()
+        self.assertIs(retrieved_client1, mock_redis_instance1)
+        mock_from_url.assert_called_with(redis_url1, decode_responses=True)
+        self.assertEqual(mock_from_url.call_count, 1)
+
+        # Second call
+        redis_url2 = "redis://localhost:6379/2"
+        client.configure(redis_url=redis_url2)
+        retrieved_client2 = client.get_client()
+        self.assertIs(retrieved_client2, mock_redis_instance2)
+        mock_from_url.assert_called_with(redis_url2, decode_responses=True)
+        self.assertEqual(mock_from_url.call_count, 2)
+
+    def test_configuration_error_message(self):
+        """
+        Test the error message of ConfigurationError.
+        """
+        with self.assertRaisesRegex(client.ConfigurationError, "Frontpunch not configured. Please call frontpunch.configure() first."):
+            client.get_client()
 
 if __name__ == '__main__':
     unittest.main()
