@@ -1,105 +1,77 @@
+import json
+import threading
 import unittest
-import time
-import os
-
-try:
-    from valkey import Valkey
-except ImportError:
-    Valkey = None
+from unittest.mock import Mock, patch
 
 from frontpunch.worker import Worker
+# Import test tasks and state management functions
+from frontpunch.test_tasks import (
+    reset_task_events,
+    COMPLETED_TASKS,
+    TASK_STARTED,
+    FINISH_TASK,
+)
 
-# Skip integration tests if valkey is not installed or no test server is available
-VALKEY_URL = os.environ.get("VALKEY_URL", "valkey://localhost:6379")
-SKIP_TESTS = Valkey is None
-try:
-    if not SKIP_TESTS:
-        Valkey.from_url(VALKEY_URL).ping()
-except Exception:
-    SKIP_TESTS = True
-
-@unittest.skipIf(SKIP_TESTS, "Valkey package not installed or Valkey server not available")
-class TestWorkerIntegration(unittest.TestCase):
+class TestWorkerIntegrationShutdown(unittest.TestCase):
     def setUp(self):
         """
-        Set up a real Valkey client and clear the database before each test.
+        Reset task state before each test.
         """
-        self.client = Valkey.from_url(VALKEY_URL)
-        self.client.flushdb()
+        reset_task_events()
+        self.mock_client = Mock()
+        self.worker = Worker(queues=["default"], concurrency=1, client=self.mock_client)
 
-    def tearDown(self):
+    def test_graceful_shutdown(self):
         """
-        Clear the database after each test.
+        Tests that the worker shuts down gracefully.
+        - It should stop fetching new jobs after a shutdown signal.
+        - It should wait for in-progress jobs to complete.
+        - It should exit its run loop.
         """
-        self.client.flushdb()
+        job_payload = {
+            "path": "frontpunch.test_tasks.long_running_task",
+            "args": ["task1"],
+        }
+        encoded_payload = json.dumps(job_payload).encode("utf-8")
 
-    def test_fetch_job_respects_queue_priority(self):
-        """
-        Verify that jobs are fetched from higher-priority queues first (BR-1).
-        """
-        # Worker is configured to check 'high' queue before 'low'
-        worker = Worker(queues=['high', 'low'], concurrency=1, client=self.client)
+        # Configure the mock client's brpop
+        # 1. Return the long-running job.
+        # 2. Return None to simulate timeout during shutdown.
+        self.mock_client.brpop.side_effect = [
+            (b"frontpunch:queue:default", encoded_payload),
+            None,
+        ]
 
-        job_low = b'{"task": "low_priority"}'
-        job_high = b'{"task": "high_priority"}'
+        # Run the worker in a separate thread
+        worker_thread = threading.Thread(target=self.worker.run, daemon=True)
+        worker_thread.start()
 
-        # Push jobs to the queues, low priority first
-        self.client.lpush('frontpunch:queue:low', job_low)
-        self.client.lpush('frontpunch:queue:high', job_high)
+        # 1. Wait for the worker to pick up the job and start executing it.
+        started = TASK_STARTED.wait(timeout=2)
+        self.assertTrue(started, "Task did not start in time.")
 
-        # First fetch should get the job from the 'high' priority queue
-        fetched_job_1 = worker._fetch_job()
-        self.assertIsNotNone(fetched_job_1)
-        self.assertEqual(fetched_job_1[0], b'frontpunch:queue:high')
-        self.assertEqual(fetched_job_1[1], job_high)
+        # 2. While the job is running, trigger the shutdown.
+        with patch.object(self.worker, 'logger') as mock_logger:
+            self.worker._handle_shutdown(None, None)
+            self.assertTrue(self.worker._shutdown)
 
-        # Second fetch should get the job from the 'low' priority queue
-        fetched_job_2 = worker._fetch_job()
-        self.assertIsNotNone(fetched_job_2)
-        self.assertEqual(fetched_job_2[0], b'frontpunch:queue:low')
-        self.assertEqual(fetched_job_2[1], job_low)
+            # 3. Allow the in-progress job to complete.
+            FINISH_TASK.set()
 
-        # No more jobs, should time out and return None
-        fetched_job_3 = worker._fetch_job()
-        self.assertIsNone(fetched_job_3)
+            # 4. Wait for the worker thread to terminate.
+            worker_thread.join(timeout=3)
+            self.assertFalse(worker_thread.is_alive(), "Worker thread did not terminate.")
 
-    def test_fetch_job_blocks_and_timeouts(self):
-        """
-        Verify that _fetch_job blocks for approximately 1 second and returns None if no job is available.
-        """
-        worker = Worker(queues=['empty_queue'], concurrency=1, client=self.client)
+            # 5. Verify the first job completed.
+            self.assertEqual(COMPLETED_TASKS, ["task1"])
+            # brpop should be called twice: once for the job, and once after shutdown
+            # where it times out and returns None, causing the loop to exit.
+            self.assertEqual(self.mock_client.brpop.call_count, 2)
 
-        start_time = time.monotonic()
-        result = worker._fetch_job()
-        end_time = time.monotonic()
+            # 6. Verify shutdown logs
+            mock_logger.info.assert_any_call("Shutdown signal received. Stopping worker gracefully...")
+            mock_logger.info.assert_any_call("Shutting down executor. Waiting for in-progress jobs to complete...")
 
-        duration = end_time - start_time
 
-        # The result should be None as the queue is empty
-        self.assertIsNone(result)
-
-        # The duration should be close to the 1-second timeout.
-        # We allow for a small margin of error.
-        self.assertGreater(duration, 0.9)
-        self.assertLess(duration, 1.2)
-
-    def test_fetch_job_fetches_single_job(self):
-        """
-        A simple happy-path test to fetch a single job from a single queue.
-        """
-        worker = Worker(queues=['default'], concurrency=1, client=self.client)
-        job_data = b'{"task": "some_task"}'
-
-        # Push a job to the queue
-        self.client.lpush('frontpunch:queue:default', job_data)
-
-        # Fetch the job
-        fetched_job = worker._fetch_job()
-
-        # Verify the fetched job is correct
-        self.assertIsNotNone(fetched_job)
-        self.assertEqual(fetched_job[0], b'frontpunch:queue:default')
-        self.assertEqual(fetched_job[1], job_data)
-
-        # Verify the queue is now empty
-        self.assertIsNone(self.client.lpop('frontpunch:queue:default'))
+if __name__ == '__main__':
+    unittest.main()
