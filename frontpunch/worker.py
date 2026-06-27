@@ -1,3 +1,5 @@
+import json
+import importlib
 import logging
 from typing import Any, List, Optional
 
@@ -55,3 +57,27 @@ class Worker:
         queue_keys = [f"frontpunch:queue:{q}" for q in self.queues]
         # The timeout is set to 1 to prevent blocking indefinitely during shutdown.
         return self.client.brpop(queue_keys, timeout=1)
+
+    def _execute_job(self, payload: str) -> None:
+        """
+        Deserializes and executes a job from a JSON payload.
+        Handles JSON, schema, and import errors gracefully.
+        """
+        try:
+            job_data = json.loads(payload)
+            path = job_data["path"]
+            args = job_data["args"]
+
+            module_path, func_name = path.rsplit(".", 1)
+            module = importlib.import_module(module_path)
+            func = getattr(module, func_name)
+
+            # Assuming args is a dict for keyword arguments.
+            func(**args)
+        except json.JSONDecodeError:
+            self.logger.error("Failed to decode JSON payload: %s", payload)
+        except KeyError as e:
+            self.logger.error("Missing key in job payload: %s. Payload: %s", e, payload)
+        except (ImportError, AttributeError) as e:
+            # At this point, job_data and job_data['path'] are guaranteed to exist.
+            self.logger.error("Failed to import or find function '%s': %s", job_data["path"], e)
