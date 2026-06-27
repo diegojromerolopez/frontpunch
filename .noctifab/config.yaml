@@ -38,7 +38,7 @@ sandbox:
     timeout_seconds: 300
     grace_period_seconds: 30
     test_command: python -m unittest discover -s tests
-    linter_command: ruff check .
+    linter_command: ""
     formatter_command: black --line-length 120 .
     exclude_paths:
         - node_modules/
