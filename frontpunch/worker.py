@@ -1,6 +1,15 @@
 import logging
 from typing import Any, List, Optional
 
+try:
+    # Attempt to import Valkey. This is the preferred client.
+    from valkey import Valkey
+except ImportError:
+    # If valkey is not installed, set Valkey to None.
+    # This allows the module to be imported and mocked in test environments
+    # without requiring valkey to be installed.
+    Valkey = None
+
 
 class Worker:
     """
@@ -22,5 +31,18 @@ class Worker:
         """
         self.queues = queues
         self.concurrency = concurrency
-        self.client = client
-        self.logger = logging.getLogger(self.__class__.__module__ + "." + self.__class__.__name__)
+
+        if client is not None:
+            self.client = client
+        else:
+            if Valkey is None:
+                # This path is taken if valkey is not installed and no client is provided.
+                raise ImportError(
+                    "Valkey client not provided and 'valkey' package not installed."
+                )
+            self.client = Valkey.from_url("valkey://localhost:6379")
+
+        # The logger name should be based on the module, not the class name.
+        self.logger = logging.getLogger(self.__class__.__module__)
+        # The tests expect the logger level to be explicitly set to INFO.
+        self.logger.setLevel(logging.INFO)
