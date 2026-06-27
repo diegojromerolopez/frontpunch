@@ -61,6 +61,45 @@ class Worker:
     def _execute_job(self, payload: str) -> None:
         """
         Deserializes and executes a job from a JSON payload.
+
+        Handles JSON decoding, key errors for missing payload fields,
+        and import errors for the task function. Errors are logged,
+        but the worker thread is not crashed.
+        """
+        try:
+            job_data = json.loads(payload)
+            task_path = job_data["path"]
+            task_args = job_data["args"]
+        except json.JSONDecodeError:
+            self.logger.error("Failed to decode job payload: %s", payload)
+            return
+        except KeyError as e:
+            self.logger.error("Missing key in job payload: %s. Payload: %s", e, payload)
+            return
+
+        try:
+            module_path, function_name = task_path.rsplit(".", 1)
+            module = importlib.import_module(module_path)
+            task_function = getattr(module, function_name)
+
+            self.logger.info("Executing job: %s with args %s", task_path, task_args)
+            task_function(*task_args)
+            self.logger.info("Job %s completed successfully.", task_path)
+        except (ImportError, AttributeError) as e:
+            # This handles both module not found and function not found in module.
+            self.logger.error("Failed to import or find task '%s': %s", task_path, e)
+        except Exception as e:
+            # A broad exception to catch errors within the executed task itself.
+            self.logger.critical(
+                "An unexpected error occurred during execution of task '%s': %s",
+                task_path,
+                e,
+                exc_info=True,
+            )
+
+    def _execute_job(self, payload: str) -> None:
+        """
+        Deserializes and executes a job from a JSON payload.
         Handles JSON, schema, and import errors gracefully.
         """
         try:
