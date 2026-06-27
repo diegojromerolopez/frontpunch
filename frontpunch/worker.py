@@ -2,8 +2,9 @@ import json
 import importlib
 import logging
 import signal
-from typing import Any, List, Optional
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, List, Optional
 
 try:
     # Attempt to import Valkey. This is the preferred client.
@@ -35,7 +36,7 @@ class Worker:
         """
         self.queues = queues
         self.concurrency = concurrency
-        self._shutdown = False
+        self.shutdown_event = threading.Event()
 
         if client is not None:
             self.client = client
@@ -47,23 +48,25 @@ class Worker:
                 )
             self.client = Valkey.from_url("valkey://localhost:6379")
 
-        # The logger name should be based on the module, not the class name.
         self.logger = logging.getLogger(self.__class__.__module__)
-        # The tests expect the logger level to be explicitly set to INFO.
         self.logger.setLevel(logging.INFO)
 
     def _handle_shutdown(self, signum, frame):
         """
-        Handles shutdown signals.
+        Signal handler to initiate a graceful shutdown.
         """
-        self.logger.info("Shutdown signal received. Stopping worker gracefully...")
-        self._shutdown = True
+        self.logger.info(
+            "Shutdown signal received (SIG %s). Stopping job fetching...", signum
+        )
+        self.shutdown_event.set()
 
     def _fetch_job(self) -> Optional[Any]:
         """
         Fetches a job from the queues using a blocking pop.
         Respects the order of queues for priority.
         """
+        if self.shutdown_event.is_set():
+            return None
         queue_keys = [f"frontpunch:queue:{q}" for q in self.queues]
         # The timeout is set to 1 to prevent blocking indefinitely during shutdown.
         return self.client.brpop(queue_keys, timeout=1)
@@ -71,11 +74,9 @@ class Worker:
     def _execute_job(self, payload: str) -> None:
         """
         Deserializes and executes a job from a JSON payload.
-
-        Handles JSON decoding, key errors for missing payload fields,
-        and import errors for the task function. Errors are logged,
-        but the worker thread is not crashed.
+        Handles JSON, schema, and import errors gracefully.
         """
+        job_data = {}  # Ensure job_data is defined for error logging
         try:
             job_data = json.loads(payload)
             task_path = job_data["path"]
@@ -99,17 +100,15 @@ class Worker:
                 task_function(**task_args)
             else:
                 self.logger.error(
-                    "Job 'args' must be a list or a dict, but got %s for task %s",
-                    type(task_args),
+                    "Invalid 'args' type for task %s: %s. Must be list or dict.",
                     task_path,
+                    type(task_args),
                 )
                 return
             self.logger.info("Job %s completed successfully.", task_path)
         except (ImportError, AttributeError) as e:
-            # This handles both module not found and function not found in module.
             self.logger.error("Failed to import or find task '%s': %s", task_path, e)
         except Exception as e:
-            # A broad exception to catch errors within the executed task itself.
             self.logger.critical(
                 "An unexpected error occurred during execution of task '%s': %s",
                 task_path,
@@ -119,20 +118,25 @@ class Worker:
 
     def run(self):
         """
-        Starts the worker's main loop.
-        Initializes a ThreadPoolExecutor and continuously fetches and submits jobs.
+        Starts the worker, fetching and processing jobs until a shutdown is requested.
         """
-        signal.signal(signal.SIGINT, self._handle_shutdown)
-        signal.signal(signal.SIGTERM, self._handle_shutdown)
+        # Signal handlers can only be registered in the main thread.
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGINT, self._handle_shutdown)
+            signal.signal(signal.SIGTERM, self._handle_shutdown)
 
-        executor = ThreadPoolExecutor(max_workers=self.concurrency)
+        self.logger.info(
+            f"Worker starting. Concurrency: {self.concurrency}. Queues: {self.queues}"
+        )
 
-        while not self._shutdown:
-            job = self._fetch_job()
-            if job:
-                # brpop returns a tuple (queue_name, job_payload)
-                _queue_name, payload = job
-                # The payload is bytes, needs decoding
-                executor.submit(self._execute_job, payload.decode('utf-8'))
+        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+            while not self.shutdown_event.is_set():
+                job = self._fetch_job()
+                if job:
+                    _, payload = job
+                    executor.submit(self._execute_job, payload.decode("utf-8"))
 
-        executor.shutdown(wait=True)
+            self.logger.info(
+                "Shutting down executor. Waiting for in-progress tasks to complete..."
+            )
+        self.logger.info("Worker has shut down.")
