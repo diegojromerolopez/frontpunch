@@ -1,6 +1,5 @@
 import unittest
 from click.testing import CliRunner
-from click import UsageError
 
 from frontpunch.cli import main
 
@@ -15,8 +14,8 @@ class TestCliWorkerValidation(unittest.TestCase):
         """
         result = self.runner.invoke(main, ['worker', '--queues', 'default', '--concurrency', '0'])
         self.assertNotEqual(result.exit_code, 0)
-        self.assertIsInstance(result.exception, UsageError)
-        self.assertEqual(str(result.exception), "Concurrency must be a positive integer.")
+        self.assertIsInstance(result.exception, SystemExit)
+        self.assertIn("Concurrency must be a positive integer.", result.output)
 
     def test_worker_concurrency_negative(self):
         """
@@ -24,8 +23,8 @@ class TestCliWorkerValidation(unittest.TestCase):
         """
         result = self.runner.invoke(main, ['worker', '--queues', 'default', '--concurrency', '-5'])
         self.assertNotEqual(result.exit_code, 0)
-        self.assertIsInstance(result.exception, UsageError)
-        self.assertEqual(str(result.exception), "Concurrency must be a positive integer.")
+        self.assertIsInstance(result.exception, SystemExit)
+        self.assertIn("Concurrency must be a positive integer.", result.output)
 
     def test_worker_concurrency_non_integer(self):
         """
@@ -33,7 +32,7 @@ class TestCliWorkerValidation(unittest.TestCase):
         """
         result = self.runner.invoke(main, ['worker', '--queues', 'default', '--concurrency', 'abc'])
         self.assertNotEqual(result.exit_code, 0)
-        self.assertIsInstance(result.exception, UsageError)
+        self.assertIsInstance(result.exception, SystemExit)
         self.assertIn("Invalid value for '--concurrency': 'abc' is not a valid integer.", result.output)
 
     def test_worker_missing_queues(self):
@@ -42,5 +41,5 @@ class TestCliWorkerValidation(unittest.TestCase):
         """
         result = self.runner.invoke(main, ['worker'])
         self.assertNotEqual(result.exit_code, 0)
-        self.assertIsInstance(result.exception, UsageError)
+        self.assertIsInstance(result.exception, SystemExit)
         self.assertIn("Missing option '--queues'", result.output)
