@@ -46,3 +46,12 @@ class Worker:
         self.logger = logging.getLogger(self.__class__.__module__)
         # The tests expect the logger level to be explicitly set to INFO.
         self.logger.setLevel(logging.INFO)
+
+    def _fetch_job(self) -> Optional[Any]:
+        """
+        Fetches a job from the queues using a blocking pop.
+        Respects the order of queues for priority.
+        """
+        queue_keys = [f"frontpunch:queue:{q}" for q in self.queues]
+        # The timeout is set to 1 to prevent blocking indefinitely during shutdown.
+        return self.client.brpop(queue_keys, timeout=1)
