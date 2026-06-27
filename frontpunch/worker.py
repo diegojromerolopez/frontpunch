@@ -2,6 +2,7 @@ import json
 import importlib
 import logging
 from typing import Any, List, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     # Attempt to import Valkey. This is the preferred client.
@@ -83,7 +84,17 @@ class Worker:
             task_function = getattr(module, function_name)
 
             self.logger.info("Executing job: %s with args %s", task_path, task_args)
-            task_function(*task_args)
+            if isinstance(task_args, list):
+                task_function(*task_args)
+            elif isinstance(task_args, dict):
+                task_function(**task_args)
+            else:
+                self.logger.error(
+                    "Job 'args' must be a list or a dict, but got %s for task %s",
+                    type(task_args),
+                    task_path,
+                )
+                return
             self.logger.info("Job %s completed successfully.", task_path)
         except (ImportError, AttributeError) as e:
             # This handles both module not found and function not found in module.
@@ -97,26 +108,16 @@ class Worker:
                 exc_info=True,
             )
 
-    def _execute_job(self, payload: str) -> None:
+    def run(self):
         """
-        Deserializes and executes a job from a JSON payload.
-        Handles JSON, schema, and import errors gracefully.
+        Starts the worker's main loop.
+        Initializes a ThreadPoolExecutor and continuously fetches and submits jobs.
         """
-        try:
-            job_data = json.loads(payload)
-            path = job_data["path"]
-            args = job_data["args"]
-
-            module_path, func_name = path.rsplit(".", 1)
-            module = importlib.import_module(module_path)
-            func = getattr(module, func_name)
-
-            # Assuming args is a dict for keyword arguments.
-            func(**args)
-        except json.JSONDecodeError:
-            self.logger.error("Failed to decode JSON payload: %s", payload)
-        except KeyError as e:
-            self.logger.error("Missing key in job payload: %s. Payload: %s", e, payload)
-        except (ImportError, AttributeError) as e:
-            # At this point, job_data and job_data['path'] are guaranteed to exist.
-            self.logger.error("Failed to import or find function '%s': %s", job_data["path"], e)
+        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+            while True:
+                job = self._fetch_job()
+                if job:
+                    # brpop returns a tuple (queue_name, job_payload)
+                    _queue_name, payload = job
+                    # The payload is bytes, needs decoding
+                    executor.submit(self._execute_job, payload.decode('utf-8'))
