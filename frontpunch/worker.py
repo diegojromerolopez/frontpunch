@@ -1,123 +1,92 @@
 import json
-import importlib
 import logging
-from typing import Any, List, Optional
-from concurrent.futures import ThreadPoolExecutor
+from importlib import import_module
 
 try:
-    # Attempt to import Valkey. This is the preferred client.
     from valkey import Valkey
 except ImportError:
-    # If valkey is not installed, set Valkey to None.
-    # This allows the module to be imported and mocked in test environments
-    # without requiring valkey to be installed.
     Valkey = None
-
 
 class Worker:
     """
-    A worker that processes jobs from specified queues.
+    A simple worker that fetches jobs from Valkey queues and executes them.
     """
-
-    def __init__(
-        self,
-        queues: List[str],
-        concurrency: int,
-        client: Optional[Any] = None,
-    ):
+    def __init__(self, queues, concurrency=1, client=None, valkey_url="valkey://localhost:6379"):
         """
         Initializes the worker.
 
-        :param queues: A list of queue names to listen to.
-        :param concurrency: The number of concurrent jobs to run.
-        :param client: An optional Valkey/Redis client instance for testability.
+        :param queues: A list of queue names to listen to, in order of priority.
+        :param concurrency: The number of concurrent jobs to run (not implemented yet).
+        :param client: An existing Valkey client instance. If not provided, a new one is created.
+        :param valkey_url: The Valkey URL to connect to if a client is not provided.
         """
         self.queues = queues
         self.concurrency = concurrency
-
-        if client is not None:
+        
+        if client:
             self.client = client
         else:
             if Valkey is None:
-                # This path is taken if valkey is not installed and no client is provided.
-                raise ImportError(
-                    "Valkey client not provided and 'valkey' package not installed."
-                )
-            self.client = Valkey.from_url("valkey://localhost:6379")
+                raise ImportError("Valkey client not provided and 'valkey' package not installed.")
+            self.client = Valkey.from_url(valkey_url)
+            
+        self.queue_keys = [f"frontpunch:queue:{q}" for q in self.queues]
 
-        # The logger name should be based on the module, not the class name.
-        self.logger = logging.getLogger(self.__class__.__module__)
-        # The tests expect the logger level to be explicitly set to INFO.
-        self.logger.setLevel(logging.INFO)
-
-    def _fetch_job(self) -> Optional[Any]:
+    def _fetch_job(self, timeout=1):
         """
-        Fetches a job from the queues using a blocking pop.
-        Respects the order of queues for priority.
+        Fetches a job from the queues using a blocking pop (BRPOP).
+        Returns a tuple (queue_name, job_data) or None if a timeout occurs.
         """
-        queue_keys = [f"frontpunch:queue:{q}" for q in self.queues]
-        # The timeout is set to 1 to prevent blocking indefinitely during shutdown.
-        return self.client.brpop(queue_keys, timeout=1)
+        return self.client.brpop(self.queue_keys, timeout=timeout)
 
-    def _execute_job(self, payload: str) -> None:
+    def process_job(self, job_data):
         """
-        Deserializes and executes a job from a JSON payload.
-
-        Handles JSON decoding, key errors for missing payload fields,
-        and import errors for the task function. Errors are logged,
-        but the worker thread is not crashed.
+        Deserializes and executes a job. Handles various error conditions.
         """
         try:
-            job_data = json.loads(payload)
-            task_path = job_data["path"]
-            task_args = job_data["args"]
-        except json.JSONDecodeError:
-            self.logger.error("Failed to decode job payload: %s", payload)
-            return
-        except KeyError as e:
-            self.logger.error("Missing key in job payload: %s. Payload: %s", e, payload)
+            # job_data is bytes, decode it first
+            payload = json.loads(job_data.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logging.error(f"Failed to decode JSON payload: {job_data!r}")
             return
 
         try:
-            module_path, function_name = task_path.rsplit(".", 1)
-            module = importlib.import_module(module_path)
-            task_function = getattr(module, function_name)
+            func_path = payload.get('func')
+            if not func_path or not isinstance(func_path, str):
+                 logging.error(f"Invalid or missing 'func' in payload: {payload}")
+                 return
 
-            self.logger.info("Executing job: %s with args %s", task_path, task_args)
-            if isinstance(task_args, list):
-                task_function(*task_args)
-            elif isinstance(task_args, dict):
-                task_function(**task_args)
+            module_path, func_name = func_path.rsplit('.', 1)
+            module = import_module(module_path)
+            func = getattr(module, func_name)
+        except (ImportError, AttributeError, ValueError):
+            logging.error(f"Failed to import function: {payload.get('func')}")
+            return
+
+        args = payload.get('args', [])
+        
+        try:
+            if isinstance(args, list):
+                func(*args)
+            elif isinstance(args, dict):
+                func(**args)
             else:
-                self.logger.error(
-                    "Job 'args' must be a list or a dict, but got %s for task %s",
-                    type(task_args),
-                    task_path,
-                )
-                return
-            self.logger.info("Job %s completed successfully.", task_path)
-        except (ImportError, AttributeError) as e:
-            # This handles both module not found and function not found in module.
-            self.logger.error("Failed to import or find task '%s': %s", task_path, e)
+                logging.error(f"Invalid 'args' type in payload: {type(args)}")
         except Exception as e:
-            # A broad exception to catch errors within the executed task itself.
-            self.logger.critical(
-                "An unexpected error occurred during execution of task '%s': %s",
-                task_path,
-                e,
-                exc_info=True,
-            )
+            # Catching a broad exception to prevent the worker from crashing.
+            logging.error(f"Job execution failed for {payload.get('func')}: {e}", exc_info=True)
 
-    def run(self):
+    def run(self, burst=False):
         """
-        Starts the worker's main loop.
-        Initializes a ThreadPoolExecutor and continuously fetches and submits jobs.
+        Main worker loop. Fetches and processes jobs continuously.
+        
+        :param burst: If True, the worker will exit after processing one job or timing out.
         """
-        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-            while True:
-                job = self._fetch_job()
-                if job:
-                    # brpop returns a tuple (queue_name, job_payload)
-                    _queue_name, payload = job
-                    # The payload is bytes, needs decoding
-                    executor.submit(self._execute_job, payload.decode('utf-8'))
+        while True:
+            job = self._fetch_job()
+            if job:
+                _queue_name, job_data = job
+                self.process_job(job_data)
+            
+            if burst:
+                break
