@@ -23,8 +23,10 @@ class Worker:
             try:
                 _queue, job_payload_str = self.redis_client.blpop(self.queues)
             except StopIteration:
+                # This is raised by mocks in tests to stop the loop.
                 raise
             except Exception:
+                # Could be a Redis connection error. Wait a bit and retry.
                 time.sleep(1)
                 continue
 
@@ -36,6 +38,8 @@ class Worker:
             task_func = self.tasks.get(task_name)
 
             if not task_func:
+                # If task is not found, we could move it to dead-letter queue.
+                # For now, just skipping as per original logic.
                 continue
 
             try:
@@ -45,6 +49,8 @@ class Worker:
                 else:
                     task_func(*args)
             except Exception as e:
+                # We do not catch BaseException, so things like KeyboardInterrupt
+                # will still stop the worker.
                 retry_count = payload.get("retry_count", 0)
                 max_retries = payload.get("max_retries", 0)
 
@@ -52,6 +58,7 @@ class Worker:
                 payload["error_message"] = str(e)
 
                 if max_retries > 0 and retry_count < max_retries:
+                    # We have retries available.
                     payload["retry_count"] = retry_count + 1
                     delay = self._calculate_backoff_delay(payload["retry_count"])
                     scheduled_time = time.time() + delay
@@ -59,4 +66,6 @@ class Worker:
                         "frontpunch:scheduled", {json.dumps(payload): scheduled_time}
                     )
                 else:
+                    # No retries left or retries are disabled.
+                    # Move to the dead-letter queue.
                     self.redis_client.rpush("frontpunch:dead", json.dumps(payload))
