@@ -37,27 +37,29 @@ class TestWorkerGracefulShutdown(unittest.TestCase):
             "args": [0.2]
         }).encode('utf-8')
 
-        short_task_payload = json.dumps({
-            "path": "frontpunch.test_tasks.simple_task",
-            "args": [1, 1]
-        }).encode('utf-8')
-
         original_execute_job = self.worker._execute_job
         def execute_job_wrapper(payload):
             task_started_event.set()
             return original_execute_job(payload)
         self.worker._execute_job = execute_job_wrapper
 
-        def brpop_side_effect(*args, **kwargs):
-            # Guideline 18: Use an event, not time.sleep(), to simulate blocking
+        # We use a callable for side_effect to control the mock's behavior
+        # across multiple calls within the worker's loop.
+        brpop_calls = 0
+        def brpop_side_effect_handler(*args, **kwargs):
+            nonlocal brpop_calls
+            brpop_calls += 1
+            if brpop_calls == 1:
+                # The first call to brpop returns the long-running task.
+                return (b'frontpunch:queue:test', long_task_payload)
+
+            # The second call simulates blocking until the test signals it to continue.
+            # This mimics waiting for a job that never arrives because we're shutting down.
             unblock_brpop_event.wait(timeout=2)
+            # After being unblocked, it returns None, simulating a brpop timeout.
             return None
 
-        self.mock_client.brpop.side_effect = [
-            (b'frontpunch:queue:test', long_task_payload),
-            brpop_side_effect,
-            (b'frontpunch:queue:test', short_task_payload), # Should not be called
-        ]
+        self.mock_client.brpop.side_effect = brpop_side_effect_handler
 
         worker_thread = threading.Thread(target=self.worker.run)
         
