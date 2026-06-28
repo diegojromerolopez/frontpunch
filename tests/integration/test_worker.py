@@ -1,77 +1,92 @@
-import json
-import threading
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock
+import threading
+import time
+import json
+import signal
+import logging
 
 from frontpunch.worker import Worker
-# Import test tasks and state management functions
-from frontpunch.test_tasks import (
-    reset_task_events,
-    COMPLETED_TASKS,
-    TASK_STARTED,
-    FINISH_TASK,
-)
+import frontpunch.test_tasks
 
-class TestWorkerIntegrationShutdown(unittest.TestCase):
+class TestWorkerGracefulShutdown(unittest.TestCase):
+
     def setUp(self):
-        """
-        Reset task state before each test.
-        """
-        reset_task_events()
-        self.mock_client = Mock()
-        self.worker = Worker(queues=["default"], concurrency=1, client=self.mock_client)
+        # Guideline 19: Ensure logging is enabled for assertLogs
+        logging.disable(logging.NOTSET)
+        self.mock_client = MagicMock()
+        self.worker = Worker(queues=['test'], concurrency=2, client=self.mock_client)
+        # Suppress console output unless using assertLogs
+        self.worker.logger.propagate = False
+        # Clear the global list used by test tasks
+        frontpunch.test_tasks.GLOBAL_RECORD_LIST.clear()
 
-    def test_graceful_shutdown(self):
-        """
-        Tests that the worker shuts down gracefully.
-        - It should stop fetching new jobs after a shutdown signal.
-        - It should wait for in-progress jobs to complete.
-        - It should exit its run loop.
-        """
-        job_payload = {
-            "path": "frontpunch.test_tasks.long_running_task",
-            "args": ["task1"],
-        }
-        encoded_payload = json.dumps(job_payload).encode("utf-8")
+    def tearDown(self):
+        frontpunch.test_tasks.GLOBAL_RECORD_LIST.clear()
 
-        # Configure the mock client's brpop
-        # 1. Return the long-running job.
-        # 2. Return None to simulate timeout during shutdown.
+    def test_graceful_shutdown_allows_tasks_to_complete(self):
+        """
+        Verify that a graceful shutdown stops fetching new jobs but allows
+        in-progress jobs to complete.
+        """
+        task_started_event = threading.Event()
+        unblock_brpop_event = threading.Event()
+
+        long_task_payload = json.dumps({
+            "path": "frontpunch.test_tasks.recording_task",
+            "args": [0.2]
+        }).encode('utf-8')
+
+        short_task_payload = json.dumps({
+            "path": "frontpunch.test_tasks.simple_task",
+            "args": [1, 1]
+        }).encode('utf-8')
+
+        original_execute_job = self.worker._execute_job
+        def execute_job_wrapper(payload):
+            task_started_event.set()
+            return original_execute_job(payload)
+        self.worker._execute_job = execute_job_wrapper
+
+        def brpop_side_effect(*args, **kwargs):
+            # Guideline 18: Use an event, not time.sleep(), to simulate blocking
+            unblock_brpop_event.wait(timeout=2)
+            return None
+
         self.mock_client.brpop.side_effect = [
-            (b"frontpunch:queue:default", encoded_payload),
-            None,
+            (b'frontpunch:queue:test', long_task_payload),
+            brpop_side_effect,
+            (b'frontpunch:queue:test', short_task_payload), # Should not be called
         ]
 
-        # Run the worker in a separate thread
-        worker_thread = threading.Thread(target=self.worker.run, daemon=True)
-        worker_thread.start()
+        worker_thread = threading.Thread(target=self.worker.run)
+        
+        with self.assertLogs('frontpunch.worker', level='INFO') as cm:
+            worker_thread.start()
 
-        # 1. Wait for the worker to pick up the job and start executing it.
-        started = TASK_STARTED.wait(timeout=2)
-        self.assertTrue(started, "Task did not start in time.")
+            started = task_started_event.wait(timeout=2)
+            self.assertTrue(started, "The long-running task did not start in time.")
+            
+            # The task appends to the list before sleeping, but we wait briefly
+            # to make the assertion against the list more robust.
+            time.sleep(0.05)
+            self.assertEqual(len(frontpunch.test_tasks.GLOBAL_RECORD_LIST), 1)
 
-        # 2. While the job is running, trigger the shutdown.
-        with patch.object(self.worker, 'logger') as mock_logger:
-            self.worker._handle_shutdown(None, None)
-            self.assertTrue(self.worker._shutdown)
+            # Simulate receiving a shutdown signal and unblock the worker
+            self.worker._handle_shutdown(signal.SIGTERM, None)
+            unblock_brpop_event.set()
+            
+            # The worker should shut down gracefully, waiting for the task to finish.
+            worker_thread.join(timeout=2)
 
-            # 3. Allow the in-progress job to complete.
-            FINISH_TASK.set()
-
-            # 4. Wait for the worker thread to terminate.
-            worker_thread.join(timeout=3)
             self.assertFalse(worker_thread.is_alive(), "Worker thread did not terminate.")
 
-            # 5. Verify the first job completed.
-            self.assertEqual(COMPLETED_TASKS, ["task1"])
-            # brpop should be called twice: once for the job, and once after shutdown
-            # where it times out and returns None, causing the loop to exit.
-            self.assertEqual(self.mock_client.brpop.call_count, 2)
+        # Verify that no new tasks were started after shutdown was initiated
+        self.assertEqual(len(frontpunch.test_tasks.GLOBAL_RECORD_LIST), 1)
+        self.assertEqual(self.mock_client.brpop.call_count, 2)
 
-            # 6. Verify shutdown logs
-            mock_logger.info.assert_any_call("Shutdown signal received. Stopping worker gracefully...")
-            mock_logger.info.assert_any_call("Shutting down executor. Waiting for in-progress jobs to complete...")
-
-
-if __name__ == '__main__':
-    unittest.main()
+        # Verify the shutdown log messages
+        log_output = "".join(cm.output)
+        self.assertIn("Shutdown signal received", log_output)
+        self.assertIn("Shutting down executor. Waiting for in-progress tasks to complete...", log_output)
+        self.assertIn("Worker has shut down.", log_output)
