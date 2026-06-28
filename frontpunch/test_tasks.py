@@ -1,29 +1,20 @@
 import time
-from typing import List, Optional, Any
 
-# A global list to record execution times for testing concurrency.
-# This is a simple mechanism for inter-thread/process communication in a test context.
-GLOBAL_RECORD_LIST: List[float] = []
+# This list is intended to be patched by tests to observe side effects.
+GLOBAL_RECORD_LIST = []
 
-def recording_task(duration: float):
+def simple_task(x, y):
+    """A simple task for testing."""
+    return x + y
+
+def error_task():
+    """A task that always raises an error."""
+    raise ValueError("This is a test error")
+
+def recording_task(duration):
     """
-    A simple task that records its start time and sleeps for a given duration.
+    Records the time of execution and sleeps for a given duration.
+    Appends the start time to a global list that can be inspected in tests.
     """
     GLOBAL_RECORD_LIST.append(time.time())
     time.sleep(duration)
-
-def long_running_task(duration: float, started_event: Optional[Any] = None, finished_event: Optional[Any] = None):
-    """
-    A task that signals when it has started and when it has finished.
-    Used for testing graceful shutdown. The events can be threading.Event,
-    multiprocessing.Event, or any object with a .set() method.
-    """
-    if started_event:
-        started_event.set()
-    time.sleep(duration)
-    if finished_event:
-        finished_event.set()
-
-def simple_task(*args, **kwargs):
-    """A task that does nothing, for simple execution tests."""
-    pass
