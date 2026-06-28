@@ -68,4 +68,4 @@ class Worker:
                 else:
                     # No retries left or retries are disabled.
                     # Move to the dead-letter queue.
-                    self.redis_client.rpush("frontpunch:dead", json.dumps(payload))
+                    self.redis_client.lpush("frontpunch:dead", json.dumps(payload))
