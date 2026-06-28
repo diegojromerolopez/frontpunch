@@ -13,6 +13,8 @@ class TestRetryBackoffFormula(unittest.TestCase):
         """
         Set up a Worker instance for testing.
         """
+        # The _calculate_backoff_delay method is a pure function and doesn't use
+        # any instance attributes, but we need to instantiate the class.
         mock_redis_client = MagicMock()
         self.worker = Worker(
             redis_client=mock_redis_client,
@@ -35,7 +37,7 @@ class TestRetryBackoffFormula(unittest.TestCase):
         self.assertEqual(self.worker._calculate_backoff_delay(1), 26.0)
 
         # Test with retry_count = 2
-        # Expected: 15 + (2 * 10) + (2**4) = 51
+        # Expected: 15 + (2 * 10) + (2**4) = 15 + 20 + 16 = 51
         self.assertEqual(self.worker._calculate_backoff_delay(2), 51.0)
 
         # Test with retry_count = 5
