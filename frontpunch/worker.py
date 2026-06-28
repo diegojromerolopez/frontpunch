@@ -130,13 +130,17 @@ class Worker:
         )
 
         with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-            while not self.shutdown_event.is_set():
-                job = self._fetch_job()
-                if job:
-                    _, payload = job
-                    executor.submit(self._execute_job, payload.decode("utf-8"))
+            try:
+                while not self.shutdown_event.is_set():
+                    job = self._fetch_job()
+                    if job:
+                        _, payload = job
+                        executor.submit(self._execute_job, payload.decode("utf-8"))
+            finally:
+                if self.shutdown_event.is_set():
+                    self.logger.info(
+                        "Shutting down executor. Waiting for in-progress tasks to complete..."
+                    )
+                    executor.shutdown(wait=True)
 
-            self.logger.info(
-                "Shutting down executor. Waiting for in-progress tasks to complete..."
-            )
         self.logger.info("Worker has shut down.")
