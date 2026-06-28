@@ -68,56 +68,70 @@ class TestWorkerExceptionHandling(unittest.TestCase):
     @patch('time.time', return_value=1000.0)
     def test_successful_retry(self, mock_time):
         """
-        AC-1: Tests that a failed job is rescheduled for retry.
+        AC-1: A failing job with retries left is rescheduled with an updated payload.
         """
+        # Arrange
         job_payload = {
             "task": "failing_task",
             "args": [1, 2],
-            "max_retries": 3,
-            "retry_count": 0
+            "retry_count": 0,
+            "max_retries": 3
         }
         job_payload_str = json.dumps(job_payload)
+        # Simulate blpop returning this job, then raise StopIteration to stop the worker loop
         self.mock_redis_client.blpop.side_effect = [
             ('default', job_payload_str),
             StopIteration
         ]
 
+        # Act
         with self.assertRaises(StopIteration):
             self.worker.run()
 
+        # Assert
+        # 1. Task was called
+        self.mock_task.assert_called_once_with(1, 2)
+
+        # 2. zadd was called to reschedule the job
         self.mock_redis_client.zadd.assert_called_once()
-        self.mock_redis_client.lpush.assert_not_called()
+        self.mock_redis_client.rpush.assert_not_called()  # Should not go to DLQ
 
-        # Verify the details of the zadd call
-        args, kwargs = self.mock_redis_client.zadd.call_args
-        self.assertEqual(args[0], "frontpunch:scheduled")
+        # 3. Verify the zadd arguments
+        zadd_args = self.mock_redis_client.zadd.call_args
+        self.assertEqual(zadd_args.args[0], "frontpunch:scheduled")  # key
 
-        # The payload is the key in the dict passed to zadd
-        payload_str_sent = list(args[1].keys())[0]
-        payload_sent = json.loads(payload_str_sent)
+        # 4. Verify the updated payload and score
+        payload_and_score = zadd_args.args[1]
+        self.assertEqual(len(payload_and_score), 1)
 
-        self.assertEqual(payload_sent['retry_count'], 1)
-        self.assertEqual(payload_sent['error_class'], 'ValueError')
-        self.assertEqual(payload_sent['error_message'], 'Task failed!')
-        # Ensure original payload is preserved
-        self.assertEqual(payload_sent['task'], 'failing_task')
-        self.assertEqual(payload_sent['max_retries'], 3)
+        rescheduled_payload_str = list(payload_and_score.keys())[0]
+        rescheduled_payload = json.loads(rescheduled_payload_str)
+        score = list(payload_and_score.values())[0]
 
-        # Verify the score (scheduled time)
-        score_sent = list(args[1].values())[0]
-        expected_delay = self.worker._calculate_backoff_delay(1)  # retry_count is now 1
+        self.assertEqual(rescheduled_payload['retry_count'], 1)
+        self.assertEqual(rescheduled_payload['max_retries'], 3)
+        self.assertEqual(rescheduled_payload['error_class'], 'ValueError')
+        self.assertEqual(rescheduled_payload['error_message'], 'Task failed!')
+        self.assertEqual(rescheduled_payload['task'], 'failing_task')
+        self.assertEqual(rescheduled_payload['args'], [1, 2])
+
+        # 5. Verify the score calculation
+        # delay = 15 + (1 * 10) + (1**4) = 26
+        expected_delay = self.worker._calculate_backoff_delay(1)
+        self.assertEqual(expected_delay, 26.0)
         expected_score = 1000.0 + expected_delay
-        self.assertAlmostEqual(score_sent, expected_score)
+        self.assertEqual(score, expected_score)
 
-    def test_exhausted_retries_moves_to_dead_letter_queue(self):
+    def test_exhausted_retries(self):
         """
-        AC-2: Tests that a job with exhausted retries is moved to the dead-letter queue.
+        AC-2: A failing job with no retries left is sent to the dead-letter queue.
         """
+        # Arrange
         job_payload = {
             "task": "failing_task",
             "args": [],
-            "max_retries": 3,
-            "retry_count": 3  # retries exhausted
+            "retry_count": 5,
+            "max_retries": 5
         }
         job_payload_str = json.dumps(job_payload)
         self.mock_redis_client.blpop.side_effect = [
@@ -125,29 +139,41 @@ class TestWorkerExceptionHandling(unittest.TestCase):
             StopIteration
         ]
 
+        # Act
         with self.assertRaises(StopIteration):
             self.worker.run()
 
-        self.mock_redis_client.zadd.assert_not_called()
-        self.mock_redis_client.lpush.assert_called_once()
+        # Assert
+        # 1. Task was called
+        self.mock_task.assert_called_once_with()
 
-        args, kwargs = self.mock_redis_client.lpush.call_args
-        self.assertEqual(args[0], "frontpunch:dead")
+        # 2. rpush was called to send to DLQ
+        self.mock_redis_client.rpush.assert_called_once()
+        self.mock_redis_client.zadd.assert_not_called()  # Should not be rescheduled
 
-        payload_sent = json.loads(args[1])
-        self.assertEqual(payload_sent['retry_count'], 3)
-        self.assertEqual(payload_sent['error_class'], 'ValueError')
-        self.assertEqual(payload_sent['error_message'], 'Task failed!')
+        # 3. Verify rpush arguments
+        rpush_args = self.mock_redis_client.rpush.call_args
+        self.assertEqual(rpush_args.args[0], "frontpunch:dead")
 
-    def test_max_retries_zero_moves_to_dead_letter_queue(self):
+        # 4. Verify the final payload
+        final_payload_str = rpush_args.args[1]
+        final_payload = json.loads(final_payload_str)
+
+        self.assertEqual(final_payload['retry_count'], 5)  # Unchanged
+        self.assertEqual(final_payload['max_retries'], 5)
+        self.assertEqual(final_payload['error_class'], 'ValueError')
+        self.assertEqual(final_payload['error_message'], 'Task failed!')
+        self.assertEqual(final_payload['task'], 'failing_task')
+
+    def test_max_retries_zero(self):
         """
-        BR-1: Tests that a job with max_retries=0 goes directly to the dead-letter queue.
+        BR-1: A failing job with max_retries=0 is sent directly to the dead-letter queue.
         """
+        # Arrange
         job_payload = {
             "task": "failing_task",
-            "args": [],
-            "max_retries": 0,  # retries disabled
-            "retry_count": 0
+            "args": {"kwarg": "value"},
+            "max_retries": 0  # This is the key part of the test
         }
         job_payload_str = json.dumps(job_payload)
         self.mock_redis_client.blpop.side_effect = [
@@ -155,16 +181,30 @@ class TestWorkerExceptionHandling(unittest.TestCase):
             StopIteration
         ]
 
+        # Act
         with self.assertRaises(StopIteration):
             self.worker.run()
 
+        # Assert
+        # 1. Task was called
+        self.mock_task.assert_called_once_with(kwarg="value")
+
+        # 2. rpush was called to send to DLQ
+        self.mock_redis_client.rpush.assert_called_once()
         self.mock_redis_client.zadd.assert_not_called()
-        self.mock_redis_client.lpush.assert_called_once()
 
-        args, kwargs = self.mock_redis_client.lpush.call_args
-        self.assertEqual(args[0], "frontpunch:dead")
+        # 3. Verify rpush arguments
+        rpush_args = self.mock_redis_client.rpush.call_args
+        self.assertEqual(rpush_args.args[0], "frontpunch:dead")
 
-        payload_sent = json.loads(args[1])
-        self.assertEqual(payload_sent['retry_count'], 0)
-        self.assertEqual(payload_sent['error_class'], 'ValueError')
-        self.assertEqual(payload_sent['error_message'], 'Task failed!')
+        # 4. Verify the final payload
+        final_payload_str = rpush_args.args[1]
+        final_payload = json.loads(final_payload_str)
+
+        # retry_count is not in the original payload, so it defaults to 0
+        self.assertEqual(final_payload.get('retry_count', 0), 0)
+        self.assertEqual(final_payload['max_retries'], 0)
+        self.assertEqual(final_payload['error_class'], 'ValueError')
+        self.assertEqual(final_payload['error_message'], 'Task failed!')
+        self.assertEqual(final_payload['task'], 'failing_task')
+        self.assertEqual(final_payload['args'], {"kwarg": "value"})
