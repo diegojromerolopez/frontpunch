@@ -9,6 +9,16 @@ import logging
 from frontpunch.worker import Worker
 import frontpunch.test_tasks
 
+try:
+    # Attempt to import Valkey. This is the preferred client.
+    from valkey import Valkey
+except ImportError:
+    # If valkey is not installed, set Valkey to None.
+    # This allows the module to be imported and mocked in test environments
+    # without requiring valkey to be installed.
+    Valkey = None
+
+
 class TestWorkerGracefulShutdown(unittest.TestCase):
 
     def setUp(self):
@@ -92,3 +102,80 @@ class TestWorkerGracefulShutdown(unittest.TestCase):
         self.assertIn("Shutdown signal received", log_output)
         self.assertIn("Shutting down executor. Waiting for in-progress tasks to complete...", log_output)
         self.assertIn("Worker has shut down.", log_output)
+
+
+@unittest.skipIf(Valkey is None, "valkey package not installed or server not running")
+class TestWorkerPrioritizedExecution(unittest.TestCase):
+
+    def setUp(self):
+        try:
+            self.client = Valkey.from_url("valkey://localhost:6379")
+            self.client.ping()
+        except Exception as e:
+            self.fail(f"Valkey server not available on localhost:6379. {e}")
+
+        self.queues = ['critical', 'default']
+        self.queue_keys = [f"frontpunch:queue:{q}" for q in self.queues]
+
+        # Clean up before the test
+        self.client.delete(*self.queue_keys)
+        frontpunch.test_tasks.GLOBAL_RECORD_LIST.clear()
+
+    def tearDown(self):
+        # Clean up after the test
+        if hasattr(self, 'client'):
+            self.client.delete(*self.queue_keys)
+            self.client.close()
+        frontpunch.test_tasks.GLOBAL_RECORD_LIST.clear()
+
+    def test_prioritized_execution(self):
+        """
+        AC-1: Verify that the worker processes jobs from the 'critical' queue
+        before the 'default' queue.
+        """
+        # 1. Push one job to `frontpunch:queue:default` then one to `frontpunch:queue:critical`.
+        # Pushing default first makes the test more robust.
+        default_job_payload = json.dumps({
+            "path": "frontpunch.test_tasks.recording_task",
+            "args": ["default"]
+        })
+        critical_job_payload = json.dumps({
+            "path": "frontpunch.test_tasks.recording_task",
+            "args": ["critical"]
+        })
+
+        self.client.lpush('frontpunch:queue:default', default_job_payload)
+        self.client.lpush('frontpunch:queue:critical', critical_job_payload)
+
+        # 2. Run the worker.
+        worker = Worker(queues=['critical', 'default'], concurrency=1, client=self.client)
+        # Suppress console output for clean test runs
+        worker.logger.propagate = False
+
+        worker_thread = threading.Thread(target=worker.run)
+        worker_thread.start()
+
+        # 3. Verify that the job from the `critical` queue is processed first.
+        # Wait for both jobs to be processed.
+        timeout = 5  # seconds
+        start_time = time.time()
+        while len(frontpunch.test_tasks.GLOBAL_RECORD_LIST) < 2:
+            time.sleep(0.01)
+            if time.time() - start_time > timeout:
+                # To aid in debugging, let's see what was processed.
+                processed_items = len(frontpunch.test_tasks.GLOBAL_RECORD_LIST)
+                self.fail(
+                    f"Worker did not process both jobs within the timeout period. "
+                    f"Processed {processed_items} item(s)."
+                )
+
+        # Now that the jobs are done, stop the worker.
+        worker.shutdown_event.set()
+        worker_thread.join(timeout=2)
+
+        self.assertFalse(worker_thread.is_alive(), "Worker thread did not terminate.")
+
+        # Check the results
+        self.assertEqual(len(frontpunch.test_tasks.GLOBAL_RECORD_LIST), 2, "Incorrect number of tasks processed")
+        # The worker's brpop will check 'critical' first, so that job should be processed first.
+        self.assertEqual(frontpunch.test_tasks.GLOBAL_RECORD_LIST, [['critical'], ['default']])
