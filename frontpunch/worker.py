@@ -1,5 +1,9 @@
 import json
 import time
+import threading
+import signal
+import os
+import sys
 
 
 class Worker:
@@ -8,6 +12,28 @@ class Worker:
         self.queues = queues
         self.tasks = tasks
         self.running = False
+        self.shutdown_event = threading.Event()
+        self._signal_count = 0
+        self._signal_lock = threading.Lock()
+
+    def _register_signals(self):
+        try:
+            signal.signal(signal.SIGTERM, self._signal_handler)
+            signal.signal(signal.SIGINT, self._signal_handler)
+        except (ValueError, RuntimeError):
+            # signal only works in main thread, ignore if not in main thread
+            pass
+
+    def _signal_handler(self, signum, frame):
+        with self._signal_lock:
+            self._signal_count += 1
+            count = self._signal_count
+
+        if count == 1:
+            self.shutdown_event.set()
+            self.running = False
+        else:
+            os._exit(1)
 
     def _calculate_backoff_delay(self, retry_count: int) -> float:
         """
@@ -39,17 +65,23 @@ class Worker:
             self.redis_client.rpush("frontpunch:dead", json.dumps(payload))
 
     def run(self):
+        self._register_signals()
         self.running = True
-        while self.running:
+        while self.running and not self.shutdown_event.is_set():
             try:
                 _queue, job_payload_str = self.redis_client.blpop(self.queues)
             except StopIteration:
                 # This is raised by mocks in tests to stop the loop.
                 raise
             except Exception:
+                if self.shutdown_event.is_set():
+                    break
                 # Could be a Redis connection error. Wait a bit and retry.
                 time.sleep(1)
                 continue
+
+            if self.shutdown_event.is_set():
+                break
 
             if not job_payload_str:
                 continue
