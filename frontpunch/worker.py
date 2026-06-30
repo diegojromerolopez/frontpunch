@@ -67,21 +67,21 @@ class Worker:
     def run(self):
         self._register_signals()
         self.running = True
-        while self.running and not self.shutdown_event.is_set():
+        while self.running:
             try:
-                _queue, job_payload_str = self.redis_client.blpop(self.queues)
+                if self.shutdown_event.is_set() or not self.running:
+                    break
+                res = self.redis_client.blpop(self.queues)
+                if not res:
+                    continue
+                _queue, job_payload_str = res
             except StopIteration:
                 # This is raised by mocks in tests to stop the loop.
                 raise
             except Exception:
-                if self.shutdown_event.is_set():
-                    break
                 # Could be a Redis connection error. Wait a bit and retry.
                 time.sleep(1)
                 continue
-
-            if self.shutdown_event.is_set():
-                break
 
             if not job_payload_str:
                 continue
